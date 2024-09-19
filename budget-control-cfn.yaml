@@ -1,0 +1,284 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy the Budget Controls for AWS solution
+
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: Email address for the Budget Control admin.
+  S3DeploymentBucketName:
+    Type: String
+    Description: Name of an existing S3 bucket to deployment assets.
+  ActionLambdaKey:
+    Type: String
+    Description: The key of the lambda zip file.
+    Default: BC-Action-lambda.zip
+  RemediationLambdaKey:
+    Type: String
+    Description: The key of the remediation lambda zip file.
+    Default: BC-Remediation-lambda.zip
+  BudgetAmount:
+    Type: Number
+    Description: The total budget amount per month. Do not include dollar sign.
+
+Resources:
+  # Create an SNS topic for BudgetControl alerts and a subscription to the admin e-mail address
+  BudgetControlSNSAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Budget Control alerts'
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+
+  # Create an SNS topic policy for the BudgetControl alert topic for Budgets and SSM to publish to the topic
+  BudgetControlSNSAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BudgetControlSNSAlertTopic
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - budgets.amazonaws.com
+                - config.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetControlSNSAlertTopic
+
+  # Create an SNS topic for BudgetControl actions with a subscription to launch a Lambda function
+  BudgetControlSNSActionTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !GetAtt BudgetControlLambdaFunction.Arn
+          Protocol: lambda
+
+  # Create an SNS topic policy for the BudgetControl action topic for Budgets to publish to the topic
+  BudgetControlSNSActionTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BudgetControlSNSActionTopic
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetControlSNSActionTopic
+
+  # Create an SSM Parameter to hold the Budget Control SNS Alert topic ARN
+  BudgetControlSSMParameterAlertARN:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: BudgetControlSNSAlertTopic
+      Type: String
+      Value: !Ref BudgetControlSNSAlertTopic
+      Description: Budget Control SNS Alert Topic ARN
+
+  # Create an IAM role that Lambda can assume to describe, stop, and terminate EC2 instances.
+  BudgetControlLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: BudgetControlLambdaFunctionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                Resource: '*'  # DecribeInstances requires a wildcard resource
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                Resource: 
+                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/BudgetControlAction: 'Stop'
+              - Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                Resource: 
+                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/BudgetControlAction: 'Terminate'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref BudgetControlSNSAlertTopic
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/BudgetControlSNSAlertTopic
+
+# Create an IAM role that Lambda can assume to create tags for EC2 instances.
+  BudgetControlRemediationLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: BudgetControlRemediationLambdaFunctionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                Resource: 
+                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/BudgetControlAction: 'Inform'
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - BudgetControlAction
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref BudgetControlSNSAlertTopic
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/BudgetControlSNSAlertTopic
+
+  # Create a Lambda function to handle BudgetControl actions
+  BudgetControlLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref S3DeploymentBucketName
+        S3Key: !Ref ActionLambdaKey
+      Handler: BC-Action-lambda.lambda_handler
+      MemorySize: 128
+      Runtime: python3.12
+      Role: !GetAtt BudgetControlLambdaFunctionRole.Arn
+      Timeout: 60
+
+  # Create a Lambda permission to allow SNS to invoke the Lambda function
+  BudgetControlLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt BudgetControlLambdaFunction.Arn
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BudgetControlSNSActionTopic
+
+# Create a Lambda function to handle BudgetControl remediations
+  BudgetControlRemediationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref S3DeploymentBucketName
+        S3Key: !Ref RemediationLambdaKey
+      Handler: BC-Remediation-lambda.lambda_handler
+      MemorySize: 128
+      Runtime: python3.12
+      Role: !GetAtt BudgetControlRemediationLambdaFunctionRole.Arn
+      Timeout: 60
+
+  # Create a Lambda permission to allow Events to invoke the Lambda function
+  BudgetControlRemediationLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt BudgetControlRemediationLambdaFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BudgetControlRemediationEventRule.Arn
+
+  # Create a Config rule to check for required tags on EC2 instances
+  BudgetControlConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: budget-control-required-tags
+      Description: Checks for required tags on EC2 instances
+      InputParameters:
+        {
+          "tag1Key": "BudgetControlAction",
+          "tag1Value": "Inform, Stop, Terminate"
+        }
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+
+  # Create an EventBridge rule to trigger the BudgetControl remediation Lambda function
+  BudgetControlRemediationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: BudgetControl-Config-remediate
+      EventPattern:
+        {
+          "source":["aws.config"],
+          "detail-type":["Config Rules Compliance Change"],
+          "detail":
+            {
+              "messageType":["ComplianceChangeNotification"],
+              "newEvaluationResult":
+                {
+                  "complianceType":["NON_COMPLIANT"]
+                }
+            }
+        }
+      State: ENABLED
+      Description: 'Budget Control: Remediate Config non-compliance events'
+      EventBusName: default
+      Targets:
+        - Id: BC001
+          Arn: !GetAtt BudgetControlRemediationLambdaFunction.Arn
+
+  # Create a Budget for a monthly cost budget with two notifications
+  BudgetControlMonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref BudgetAmount
+          Unit: USD
+        BudgetName: BudgetControl-MonthlyBudget
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetControlSNSAlertTopic
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 90
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetControlSNSActionTopic
