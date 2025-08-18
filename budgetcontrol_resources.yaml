@@ -1,0 +1,3685 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+Parameters:
+  NotificationEmail:
+    Type: String
+  BudgetAmount:  # UPDATED:  Added a parameter for the budget amount.
+    Type: Number
+    Description: The total budget amount per month. Do not include dollar sign.
+Resources:
+  # Create a Customer Managed Key (CMK) for SNS topic encryption
+  SNSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SNS topic encryption
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-policy-sns
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow SNS to use the key
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: Allow Budgets Service to use the key
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: Allow Config Service to use the key
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: Allow Lambda to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+
+  # Create an alias for the KMS key
+  SNSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/sns-encryption-key
+      TargetKeyId: !Ref SNSEncryptionKey
+
+  ConfigEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger Lambda to add tag and default value to Non-Compliant resources
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          configRuleName:
+              - Ref: awscustomlambdaconfigdemorule
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      State: ENABLED
+      Targets:
+        - Arn: 
+            Fn::GetAtt:
+              - awsconfigNonCompliantResourceActionlambda
+              - Arn
+          Id: "TargetLambda"            
+  # SSM Parameter Store for Service-to-Action Mapping
+  ServiceActionMappingParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Type: "String" # UPDATED: All values must be Inform for the initial default.
+      Value: |
+        {
+          "AWS::SageMaker::NotebookInstance": "Inform",
+          "AWS::EC2::Instance": "Inform",
+          "AWS::SageMaker::Domain" : "Inform",
+          "AWS::OpenSearch::Domain" : "Inform",
+          "AWS::Elasticsearch::Domain" : "Inform",
+          "AWS::RDS::DBCluster" : "Inform"
+        }
+      Description: "Mapping of AWS services to the actions (Stop, Terminate, or no action)"
+
+  # SSM Parameter Store Budget Action control Key and tag values
+  ServiceResourceTagParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Type: "String"
+      Value: |
+        {
+          "Key": "BudgetControlAction", "Values": ["Inform", "Stop", "Terminate"]
+        }
+      Description: "Budget Control Action Key value pairs"      
+      
+  AuditResourceInfoDefaultTag :
+      Type: 'AWS::DynamoDB::Table'
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: ResourceId
+            AttributeType: S        
+        KeySchema:
+          - AttributeName: ResourceId
+            KeyType: HASH
+        SSESpecification:
+          SSEEnabled: true
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+  AuditResouceInfoActionStatus:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ExecutionID
+          AttributeType: S  
+        - AttributeName: ActionTimestamp
+          AttributeType: S            
+      KeySchema:
+        - AttributeName: ExecutionID
+          KeyType: HASH
+        - AttributeName: ActionTimestamp
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true          
+          
+
+  # AWS Budget
+  Budget:
+    Type: "AWS::Budgets::Budget"
+    Properties:
+      Budget:
+        BudgetName: "MonthlyCostBudget"
+        BudgetType: "COST"
+        TimeUnit: "MONTHLY"
+        BudgetLimit:
+          Amount: !Ref BudgetAmount  # UPDATED:  From new parameter above
+          Unit: "USD"
+      NotificationsWithSubscribers:
+        - Notification:  # UPDATED:  New notification to send out reminder at 80% 
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: "PERCENTAGE"
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref awsconfigbudgetcontrolnotificationtopic
+        - Notification:
+            NotificationType: "ACTUAL"
+            ComparisonOperator: "GREATER_THAN"
+            Threshold: 90
+            ThresholdType: "PERCENTAGE"
+          Subscribers:
+            - SubscriptionType: "SNS"
+              Address: !Ref BudgetAlertSFActionTopic
+
+
+  # SNS Topic for Budget Alerts - Now using CMK
+  BudgetAlertSFActionTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: Topic to trigger Step functions to take action
+      TopicName: aws-budgets-threshold-action-alert
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+      
+  BudgetAlertSNSActionTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BudgetAlertSFActionTopic
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetAlertSFActionTopic  
+ 
+ # SNS Topic Subscription for Budget Alerts
+  SnsSubscriptionForBudget:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Endpoint: !GetAtt LambdaTriggerSFFunction.Arn
+      Protocol: "lambda"
+      TopicArn: !Ref BudgetAlertSFActionTopic
+
+  LambdaTriggerSFFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+        Version: "2012-10-17"
+      Path: "/"
+      Policies:
+        - PolicyName: Cloudwatch-logs-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/aws-config-demo-lambda-sf-action:*'        
+      ManagedPolicyArns:
+        - Fn::Join:
+            - ""
+            - - "arn:"
+              - Ref: AWS::Partition
+              - :iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+  LambdaTriggerSFFunctionRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: >-
+              This policy requires broad resource access to effectively manage tagging across multiple AWS service types including SageMaker notebooks, EC2 instances, OpenSearch domains, and DMS instances. Restricting to specific resources would prevent the automated tagging functionality from working properly across your environment    
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: 
+               - "states:StartExecution"
+            Effect: Allow
+            Resource: !Ref StateMachineBudgetControl                           
+        Version: "2012-10-17"
+      PolicyName: LambdaTriggerSFFunctionRoleDefaultPolicy
+      Roles:
+        - !Ref LambdaTriggerSFFunctionRole
+
+  PermissionForBudgetAlertSFActionTopicToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt LambdaTriggerSFFunction.Arn 
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId      
+      SourceArn: !Ref BudgetAlertSFActionTopic
+                
+  LambdaTriggerSFFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W92
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend configuring appropriate concurrency limits based on your organization's usage patterns and performance requirements
+          - id: W89
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend deploying these resources within your VPC to enhance network security and meet your organization's compliance requirements
+          - id: W58
+            reason: The Lambda function has required permissions to write operational logs to CloudWatch      
+    Properties:
+      FunctionName: aws-config-demo-lambda-sf-action
+      Description: This is demo lambda to trigger step functions to take action on resources based on tag value
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 128      
+      Role: !GetAtt LambdaTriggerSFFunctionRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachineBudgetControl      
+      Code:
+        ZipFile: |
+            import json
+            import boto3
+            import os
+            from datetime import datetime
+            def json_serial(obj):
+                """JSON serializer for objects not serializable by default json code"""
+                if isinstance(obj, datetime):
+                    return obj.isoformat()
+                raise TypeError("Type not serializable")
+            def start_step_function(payload):
+                client = boto3.client('stepfunctions')
+                response = client.start_execution(
+                    stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                    name=payload["message_id"]  # Use MessageId as the name
+                )
+                return response
+            def lambda_handler(event, context):
+                try:
+                    # Store the last response to return
+                    last_response = None
+                    
+                    # Iterate through records
+                    for record in event["Records"]:
+                        payload = {
+                            "message_id": record["Sns"]["MessageId"],
+                            "message": record["Sns"]["Message"],
+                            "topic_arn": record["Sns"]["TopicArn"],
+                            "subject": record["Sns"].get("Subject", "")
+                        }
+                        
+                        # Start Step Function
+                        response = start_step_function(payload)
+                        last_response = response
+                    
+                    # Return the last response, converting datetime to ISO format
+                    return json.loads(json.dumps(last_response, default=json_serial))
+                
+                except Exception as e:
+                    print(f"Error: {str(e)}")
+                    raise  
+                    
+  # Email notification topic - Now using CMK
+  awsconfigbudgetcontrolnotificationtopic:
+    Type: AWS::SNS::Topic    
+    Properties:
+      DisplayName: Email Notification
+      TopicName: aws-config-non-compliantresource-alert
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+  
+  # Create subscription to send email to admin address for actions taken.
+  awsconfignoncomplaintresourcetopicTokenSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref NotificationEmail
+      Protocol: email
+      TopicArn: !Ref awsconfigbudgetcontrolnotificationtopic
+  
+  # Create SNS topic policy listing which services to allow use of topic.
+  awsconfignoncomplaintresourcetopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref awsconfigbudgetcontrolnotificationtopic
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - budgets.amazonaws.com
+                - config.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref awsconfigbudgetcontrolnotificationtopic
+  awsconfigcustomlambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+        Version: "2012-10-17"
+      Path: "/"
+      Policies:
+        - PolicyName: Cloudwatch-logs-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/aws-config-demo-lambda-check-tags:*'
+      ManagedPolicyArns:
+        - Fn::Join:
+            - ""
+            - - "arn:"
+              - Ref: AWS::Partition
+              - :iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+  awsconfigcustomlambdaServiceRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: >-
+              This policy requires broader resource access to effectively manage tagging across multiple SageMaker notebook instances throughout your AWS environment. Restricting to specific resources would prevent the automated tagging functionality from working properly as new notebook instances are created       
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: sns:Publish
+            Effect: Allow
+            Resource:
+              Ref: awsconfigbudgetcontrolnotificationtopic
+          - Action:
+               - "sagemaker:ListTags"
+               - "dms:ListTagsForResource"
+               - "rds:ListTagsForResource"
+               - "ec2:DescribeTags"
+               - "es:ListTags"
+            Effect: Allow
+            Resource: "*"
+          - Action: ssm:GetParameter
+            Effect: Allow
+            Resource:
+               - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceResourceTagParameter}'                                  
+          - Action: dynamodb:PutItem
+            Effect: Allow
+            Resource:
+                Fn::GetAtt:
+                  - AuditResourceInfoDefaultTag 
+                  - Arn
+          # Add KMS permissions for SNS encryption
+          - Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Effect: Allow
+            Resource: !GetAtt SNSEncryptionKey.Arn
+        Version: "2012-10-17"
+      PolicyName: awsconfigcustomlambdaServiceRoleDefaultPolicy
+      Roles:
+        - !Ref awsconfigcustomlambdaServiceRole
+  awsconfigcustomlambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W92
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend configuring appropriate concurrency limits based on your organization's usage patterns and performance requirements
+          - id: W89
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend deploying these resources within your VPC to enhance network security and meet your organization's compliance requirements
+          - id: W58
+            reason: The Lambda function has required permissions to write operational logs to CloudWatch   
+    Properties:
+      Code:
+        ZipFile: |
+            import boto3
+            import json
+            import logging
+            import os
+            from datetime import datetime
+            logger = logging.getLogger(__name__)
+            logger.setLevel(logging.INFO)
+            dynamodb = boto3.resource('dynamodb')
+            table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+            def get_required_tag():
+                ssm_client = boto3.client('ssm')
+                response = ssm_client.get_parameter(Name=os.environ['SSM_TAG_PARAMETER'])
+                required_tag = json.loads(response['Parameter']['Value'])
+                return required_tag
+            def save_compliance_result(evaluations, token):
+                config_client = boto3.client('config')
+                response = config_client.put_evaluations(
+                    Evaluations=evaluations,
+                    ResultToken=token,
+                    TestMode=False
+                )
+                logger.info(f"Save evaluation results->{response}")
+            def is_applicable(configurationItem, event):
+                status = configurationItem['configurationItemStatus']
+                eventLeftScope = event['eventLeftScope']
+                if status == 'ResourceDeleted':
+                    logger.info("Resource Deleted, setting Compliance Status to NOT_APPLICABLE.")
+                return (status == 'OK' or status == 'ResourceDiscovered') and not eventLeftScope
+            def send_notification(subject, message):
+                topic_arn = os.environ['SNS_TOPIC_ARN']
+                sns_client = boto3.client('sns')
+                response = sns_client.publish(
+                    TopicArn=topic_arn,
+                    Message=message,
+                    Subject=subject
+                )
+                message_id = response['MessageId']
+                logger.info(f'SNS topic message is published {message_id}')
+            def get_resource_tags(resource_id, resource_type):
+                client_map = {
+                    'AWS::EC2::Instance': boto3.client('ec2'),
+                    'AWS::RDS::DBCluster': boto3.client('rds'),
+                    'AWS::SageMaker::Domain': boto3.client('sagemaker'),
+                    'AWS::SageMaker::NotebookInstance': boto3.client('sagemaker'),
+                    'AWS::OpenSearch::Domain': boto3.client('opensearch'),
+                    'AWS::OpenSearchServerless::Collection': boto3.client('opensearchserverless'),
+                    'AWS::DMS::ReplicationInstance': boto3.client('dms')
+                }
+                
+                client = client_map.get(resource_type)
+                if client:
+                    if resource_type == 'AWS::EC2::Instance':
+                        response = client.describe_tags(Filters=[{'Name': 'resource-id', 'Values': [resource_id]}])
+                        return response.get('Tags', [])
+                    elif resource_type == 'AWS::RDS::DBCluster':
+                        response = client.list_tags_for_resource(ResourceName=resource_id)
+                        return response.get('TagList', [])
+                    elif resource_type in ['AWS::SageMaker::Domain', 'AWS::SageMaker::NotebookInstance']:
+                        response = client.list_tags(ResourceArn=resource_id)
+                        return response.get('Tags', [])
+                    elif resource_type in ['AWS::OpenSearch::Domain', 'AWS::OpenSearchServerless::Collection']:
+                        response = client.list_tags(ARN=resource_id)
+                        return response.get('TagList', [])
+                    elif resource_type == 'AWS::DMS::ReplicationInstance':
+                        response = client.list_tags_for_resource(ResourceArn=resource_id)
+                        return response.get('TagList', [])
+                else:
+                    logger.warning(f"Unsupported resource type {resource_type} for tagging.")
+                    return []
+            def check_tags_compliance(configurationItem, required_tag):
+                resource_type = configurationItem['resourceType']
+                resource_id = configurationItem['resourceId'] if resource_type == 'AWS::EC2::Instance' else configurationItem['ARN']
+                logger.info(f"Evaluating resource {resource_id} of type {resource_type}")
+                
+                tags = get_resource_tags(resource_id, resource_type)
+                for tag in tags:
+                    if tag['Key'] == required_tag['Key'] and tag['Value'].lower() in [val.lower() for val in required_tag['Values']]:
+                        return tag['Value']  # Resource is compliant
+                
+                return None  # No valid tag found
+            def save_audit_info(resource_info, compliance_status, timestamp, reason, tag_applied):	
+                table.put_item(Item={
+                    'ResourceId': resource_info['resourceId'],
+                    'ResourceType': resource_info['resourceType'],
+                    'ComplianceStatus': compliance_status,
+                    'TagApplied': tag_applied,
+                    'ActionStatus': 'pending',
+                    'AuditTimestamp': timestamp,
+                    'Reason': reason
+                })            
+            def create_plaintext_table(audit_info):
+                report = "Resource Compliance Status Report\n"
+                report += "-" * 50 + "\n"
+                report += "{:<20} {:<30} {:<20} {:<30} {:<30}\n".format("AWS Account ID", "Resource Type", "Resource ID", "Compliance Status", "Reason")
+                report += "-" * 50 + "\n"
+                
+                for item in audit_info:
+                    report += "{:<20} {:<30} {:<20} {:<30} {:<30}\n".format(
+                        item['awsAccountId'],
+                        item['resourceType'],
+                        item['resourceId'],
+                        item['ComplianceStatus'],
+                        item['Reason']
+                    )
+                
+                return report
+                    
+            def lambda_handler(event, context):
+                logger.info(event)
+                invoking_event = json.loads(event['invokingEvent'])
+                configuration_items = invoking_event.get('configurationItems', [invoking_event['configurationItem']])
+                evaluations = []
+                audit_info = []
+                required_tag = get_required_tag()  # Fetch dynamic tag values
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                for configuration_item in configuration_items:
+                    reason = None
+                    if not is_applicable(configuration_item, event):
+                        compliant_status = 'NOT_APPLICABLE'
+                        reason = 'Resource is deleted or left scope'
+                    else:
+                        tag_applied = check_tags_compliance(configuration_item, required_tag)
+                        if tag_applied is not None: 
+                            compliant_status = 'COMPLIANT'
+                            reason = f"Resource is compliant with tag policies, set to {tag_applied}"
+                        else:
+                            compliant_status = 'NON_COMPLIANT'
+                            reason = f"Missing required tag value(s): {required_tag['Values']}"
+                        
+                        audit_info.append({
+                            'awsAccountId': configuration_item['awsAccountId'],
+                            'resourceType': configuration_item['resourceType'],
+                            'resourceId': configuration_item['resourceId'],
+                            'ComplianceStatus': compliant_status,
+                            'Reason': reason,
+                            'Timestamp': timestamp
+                        })
+                        save_audit_info(configuration_item, compliant_status, timestamp, reason, tag_applied)
+                    evaluations.append({
+                        'ComplianceResourceType': configuration_item['resourceType'],
+                        'ComplianceResourceId': configuration_item['resourceId'],
+                        'ComplianceType': compliant_status,
+                        'OrderingTimestamp': configuration_item['configurationItemCaptureTime'],
+                        'Annotation': reason
+                    })
+                save_compliance_result(evaluations, event['resultToken'])
+                if audit_info:
+                    report_plaintext = create_plaintext_table(audit_info)
+                    subject = 'AWS Config Compliance Report'
+                    send_notification(subject, report_plaintext)
+
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME:
+            Ref: AuditResourceInfoDefaultTag 
+          SNS_TOPIC_ARN:
+            Ref: awsconfigbudgetcontrolnotificationtopic
+          SSM_TAG_PARAMETER:
+            Ref: ServiceResourceTagParameter            
+      FunctionName: aws-config-demo-lambda-check-tags
+      Description: This is demo lambda used by AWS Config custom rule to check tags on SageMaker Notebook Instance.
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - awsconfigcustomlambdaServiceRole
+          - Arn
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 128
+    DependsOn:
+      - awsconfigcustomlambdaServiceRoleDefaultPolicy
+      - awsconfigcustomlambdaServiceRole
+  awsconfigcustomlambdaCustomRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Fn::GetAtt:
+          - awsconfigcustomlambda
+          - Arn
+      Principal: config.amazonaws.com
+      SourceAccount:
+        Ref: AWS::AccountId
+
+  awsconfigNonCompliantResourceActionlambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+        Version: "2012-10-17"
+      Path: "/"
+      Policies:
+        - PolicyName: Cloudwatch-logs-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - "logs:CreateLogGroup"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/aws-config-demo-lambda-add-tags:*'        
+      ManagedPolicyArns:
+        - Fn::Join:
+            - ""
+            - - "arn:"
+              - Ref: AWS::Partition
+              - :iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+  awsconfigNonCompliantResourceActionlambdaServiceRoleDefaultPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: >-
+              This policy requires broader resource access to effectively manage tagging across multiple AWS services including SageMaker notebooks, EC2 instances, OpenSearch domains, and DMS instances. Restricting permissions to specific resources would prevent the automated tagging system from functioning properly as new resources are created across your AWS environment    
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: 
+               - "sagemaker:AddTags"
+               - "es:AddTags"
+               - "ec2:CreateTags"
+#               - "dms:AddTagsToResource"
+               - "rds:AddTagsToResource"
+            Effect: Allow
+            Condition:
+                  StringEquals:
+                    aws:RequestTag/BudgetControlAction: 'Inform'
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - BudgetControlAction
+            Resource: "*"             
+          - Action:
+               - "rds:DescribeDBClusters"
+            Effect:  Allow
+            Resource: "*"
+          - Action: ssm:GetParameter
+            Effect: Allow
+            Resource:
+               - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceActionMappingParameter}'                              
+          - Action: dynamodb:PutItem
+            Effect: Allow
+            Resource:
+                Fn::GetAtt:
+                  - AuditResourceInfoDefaultTag 
+                  - Arn
+          # Add KMS permissions for SNS encryption
+          - Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Effect: Allow
+            Resource: !GetAtt SNSEncryptionKey.Arn
+        Version: "2012-10-17"
+      PolicyName: awsconfigNonCompliantResourceActionlambdaServiceRoleDefaultPolicy
+      Roles:
+        - !Ref awsconfigNonCompliantResourceActionlambdaServiceRole
+
+  # Permission for EventBridge to invoke Lambda
+  awsconfigNonCompliantResourceActionlambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: 
+        Ref: awsconfigNonCompliantResourceActionlambda
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - ConfigEventsRule
+          - Arn
+          
+  awsconfigNonCompliantResourceActionlambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W92
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend configuring appropriate concurrency limits based on your organization's usage patterns and performance requirements
+          - id: W89
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend deploying these resources within your VPC to enhance network security and meet your organization's compliance requirements
+          - id: W58
+            reason: The Lambda function has required permissions to write operational logs to CloudWatch        
+    Properties:
+      Code:
+        ZipFile: |
+            import boto3
+            import json
+            import logging
+            import os
+            from datetime import datetime
+            from botocore.exceptions import ClientError
+            logger = logging.getLogger(__name__)
+            logger.setLevel(logging.INFO)
+            ssm_client = boto3.client('ssm')
+            config_client = boto3.client('config')
+            dynamodb = boto3.resource('dynamodb')
+            def get_action_from_ssm(resource_type):
+                """
+                Fetches the action value from SSM Parameter Store based on the resource type.
+                """
+                ssm_parameter_name = os.environ['SSM_TAG_PARAMETER']
+                response = ssm_client.get_parameter(Name=ssm_parameter_name)
+                tag_values = json.loads(response['Parameter']['Value'])
+                return tag_values.get(resource_type)
+            def log_to_dynamodb(resource_type, resource_id, tag_value,timestamp):
+                """
+                Logs the tagging action to DynamoDB with action_taken set to 'pending'.
+                """
+                table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+                item = {
+                    'ResourceType': resource_type,
+                    'ResourceId': resource_id,
+                    'TagApplied': tag_value,
+                    'ActionStatus': 'pending',
+                    'AuditTimestamp' : timestamp,
+                    'ComplianceStatus' : 'COMPLIANT',
+                    'Reason' : 'Resource is compliant with tag policies'
+                }
+                try:
+                    table.put_item(Item=item)
+                    logger.info(f"Logged action to DynamoDB for resource {resource_id} of type {resource_type}")
+                except ClientError as e:
+                    logger.error(f"Error logging action to DynamoDB for resource {resource_id}: {e}")
+            def add_tag_to_resource(resource_id, resource_type, tag_key, tag_value, aws_region, aws_account_id,timestamp):
+                """
+                Adds the BudgetControlAction tag to the resource and logs the action to DynamoDB.
+                """
+                client_map = {
+                    'AWS::EC2::Instance': boto3.client('ec2'),
+                    'AWS::RDS::DBCluster': boto3.client('rds'),
+                    'AWS::SageMaker::Domain': boto3.client('sagemaker'),
+                    'AWS::SageMaker::NotebookInstance': boto3.client('sagemaker'),
+                    'AWS::OpenSearch::Domain': boto3.client('opensearch'),
+                    'AWS::OpenSearchServerless::Collection': boto3.client('opensearchserverless'),
+                    'AWS::DMS::ReplicationInstance': boto3.client('dms')
+                }
+                
+                client = client_map.get(resource_type)
+                
+                # Construct the ARN if needed
+                resource_identifier = construct_arn(resource_type, resource_id, aws_region, aws_account_id)
+                
+                 # EC2 instances do not require ARN construction
+                if resource_type in ['AWS::EC2::Instance']:
+                    resource_identifier = resource_id
+                elif resource_type in ['AWS::RDS::DBCluster']:
+                    cluster_info = client.describe_db_clusters(Filters=[{'Name': 'db-cluster-resource-id', 'Values': [resource_id]}])
+                    resource_id = cluster_info['DBClusters'][0]['DBClusterIdentifier']
+                    resource_identifier = construct_arn(resource_type, resource_id, aws_region, aws_account_id)
+                else:
+                    # Construct ARN for other resource types
+                    resource_identifier = construct_arn(resource_type, resource_id, aws_region, aws_account_id)    
+                
+                if client:
+                    try:
+                        if resource_type == 'AWS::EC2::Instance':
+                            client.create_tags(
+                                Resources=[resource_identifier],  # For EC2, resource_identifier is resource_id
+                                Tags=[{'Key': tag_key, 'Value': tag_value}]
+                            )
+                        elif resource_type == 'AWS::RDS::DBCluster':
+                            client.add_tags_to_resource(
+                                ResourceName=resource_identifier,  # For RDS, resource_identifier is ARN
+                                Tags=[{'Key': tag_key, 'Value': tag_value}]
+                            )
+                        elif resource_type in ['AWS::SageMaker::Domain', 'AWS::SageMaker::NotebookInstance']:
+                            client.add_tags(ResourceArn=resource_identifier, Tags=[{'Key': tag_key, 'Value': tag_value}])
+                        elif resource_type in ['AWS::OpenSearch::Domain']:
+                            print(resource_identifier)
+                            response = client.add_tags(ARN=resource_identifier, TagList=[{'Key': tag_key, 'Value': tag_value}])                
+                        elif resource_type in ['AWS::OpenSearchServerless::Collection']:
+                            client.tag_resource(resourceArn=resource_identifier, TagList=[{'Key': tag_key, 'Value': tag_value}])
+                        elif resource_type == 'AWS::DMS::ReplicationInstance':
+                            client.add_tags_to_resource(ResourceArn=resource_identifier, Tags=[{'Key': tag_key, 'Value': tag_value}])
+                        logger.info(f"Successfully added tag {tag_key}: {tag_value} to resource {resource_identifier}")
+                        # Log the action to DynamoDB
+                        log_to_dynamodb(resource_type, resource_id, tag_value,timestamp)
+                    except Exception as e:
+                        logger.error(f"Error adding tag to resource {resource_identifier} of type {resource_type}: {e}")
+                else:
+                    logger.warning(f"Unsupported resource type {resource_type}, skipping tagging.")
+                    
+            def construct_arn(resource_type, resource_id, aws_region, aws_account_id):
+                """
+                Constructs the ARN for resource types that require ARN instead of resource ID.
+                """
+                arn_map = {
+                    'AWS::RDS::DBCluster': f"arn:aws:rds:{aws_region}:{aws_account_id}:cluster:{resource_id}",
+                    'AWS::SageMaker::NotebookInstance': f"arn:aws:sagemaker:{aws_region}:{aws_account_id}:notebook-instance/{resource_id}",
+                    'AWS::SageMaker::Domain': f"arn:aws:sagemaker:{aws_region}:{aws_account_id}:domain/{resource_id}",
+                    'AWS::OpenSearch::Domain': f"arn:aws:es:{aws_region}:{aws_account_id}:domain/{resource_id}",
+                    'AWS::OpenSearchServerless::Collection': f"arn:aws:opensearchserverless:{aws_region}:{aws_account_id}:collection/{resource_id}",
+                    'AWS::DMS::ReplicationInstance': f"arn:aws:dms:{aws_region}:{aws_account_id}:rep:{resource_id}"
+                }
+                # If the resource type requires an ARN, return the constructed ARN
+                return arn_map.get(resource_type, resource_id)
+                
+                
+            def lambda_handler(event, context):
+                """
+                Lambda function handler triggered by EventBridge when there is a compliance change.
+                The function adds the 'BudgetControlAction' tag to the resource and logs the action to DynamoDB.
+                """
+                logger.info(f"Received event: {json.dumps(event)}")
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Extract the resource details from the event
+                detail = event.get('detail', {})
+                resource_type = detail.get('resourceType')
+                resource_id = detail.get('resourceId')
+                compliance_type = detail.get('newEvaluationResult', {}).get('complianceType')
+                aws_region = event.get('region')
+                aws_account_id = detail.get('awsAccountId')
+                
+                # Only proceed if the resource is non-compliant
+                if compliance_type == 'NON_COMPLIANT':
+                    logger.info(f"Resource {resource_id} of type {resource_type} is NON_COMPLIANT")
+                    # Fetch the appropriate action from SSM for the resource type
+                    action = get_action_from_ssm(resource_type)
+                    if action:
+                        # Add the BudgetControlAction tag to the resource
+                        add_tag_to_resource(resource_id, resource_type, 'BudgetControlAction', action, aws_region, aws_account_id,timestamp)
+                    else:
+                        logger.warning(f"No action found for resource type {resource_type} in SSM")
+                else:
+                    logger.info(f"Resource {resource_id} is compliant, no action needed.")
+
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME:
+            Ref: AuditResourceInfoDefaultTag 
+          SSM_TAG_PARAMETER:
+            Ref: ServiceActionMappingParameter            
+      FunctionName: aws-config-demo-lambda-add-tags
+      Description: Called by AWS Config, this Lambda adds the tag and default value to non compliant resources.
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - awsconfigNonCompliantResourceActionlambdaServiceRole
+          - Arn
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 128
+    DependsOn:
+      - awsconfigNonCompliantResourceActionlambdaServiceRoleDefaultPolicy
+      - awsconfigNonCompliantResourceActionlambdaServiceRole
+      
+  awscustomlambdaconfigdemorule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: required-tags-complaince
+      Description: Calls a custom Lambda function to validate tag and value.
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::SageMaker::NotebookInstance
+          - AWS::OpenSearchServerless::Collection
+          - AWS::EC2::Instance
+          - AWS::SageMaker::Domain
+          - AWS::OpenSearch::Domain    
+          - AWS::Elasticsearch::Domain
+          - AWS::RDS::DBCluster
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+          - EventSource: aws.config
+            MessageType: OversizedConfigurationItemChangeNotification
+        SourceIdentifier:
+          Fn::GetAtt:
+            - awsconfigcustomlambda
+            - Arn
+    DependsOn:
+      - awsconfigcustomlambdaCustomRulePermission
+      - awsconfigcustomlambda
+      - awsconfigcustomlambdaServiceRoleDefaultPolicy
+      - awsconfigcustomlambdaServiceRole
+      
+
+# Reporting Function - IAM Role and IAM Policy for Reporting Lambda
+  ActionsTakenReportingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole  # For CloudWatch Logs
+      Policies:
+        - PolicyName: ActionsTakenReportingLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DynamoDB Read Only
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt AuditResouceInfoActionStatus.Arn
+              
+              # Step Functions Read Only
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                  - states:ListExecutions
+                  - states:ListStateMachines
+                Resource: !Ref StateMachineBudgetControl
+              
+              # SNS Publish
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref awsconfigbudgetcontrolnotificationtopic
+              
+              # KMS permissions for SNS encryption
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt SNSEncryptionKey.Arn
+
+# Reporting Function - Lambda Function
+  ActionsTakenReportingFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W92
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend configuring appropriate concurrency limits based on your organization's usage patterns and performance requirements
+          - id: W89
+            reason: >-
+              This deployment is configured for simplified demonstration purposes. For production environments, we recommend deploying these resources within your VPC to enhance network security and meet your organization's compliance requirements
+          - id: W58
+            reason: The Lambda function has required permissions to write operational logs to CloudWatch         
+    Properties:
+      FunctionName: aws-config-demo-lambda-reporting-actions
+      Description: This is demo lambda to send the report of the actions taken on the resources by the step functions
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 128         
+      Role: !GetAtt ActionsTakenReportingLambdaRole.Arn
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !GetAtt AuditResouceInfoActionStatus.Arn
+          SNS_TOPIC_ARN: !Ref awsconfigbudgetcontrolnotificationtopic
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          dynamodb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+          from boto3.dynamodb.conditions import Key
+
+          def create_table_format(items):
+              # Define column headers and their widths with more spacing
+              columns = {
+                  'Resource ID': 35,
+                  'Resource Type': 40,
+                  'Action Details': 45
+              }
+              
+              def wrap_text(text, width):
+                  """Helper function to wrap text to specified width"""
+                  words = str(text).split()
+                  lines = []
+                  current_line = []
+                  current_length = 0
+                  
+                  for word in words:
+                      if current_length + len(word) + 1 <= width:
+                          current_line.append(word)
+                          current_length += len(word) + 1
+                      else:
+                          if current_line:
+                              lines.append(' '.join(current_line))
+                          current_line = [word]
+                          current_length = len(word)
+                  
+                  if current_line:
+                      lines.append(' '.join(current_line))
+                      
+                  return lines if lines else ['']
+
+              # Create header
+              header = '|'
+              separator = '|'
+              for col, width in columns.items():
+                  header += f' {col:<{width}} |'
+                  separator += '-' * (width + 2) + '|'
+
+              # Create rows
+              rows = []
+              for item in items:
+                  resource_id = item.get('ResourceId', '')
+                  resource_type = item.get('ResourceType', '')
+                  action_details = item.get('ActionDetails', '')
+
+                  # Wrap text for each column
+                  wrapped_id = wrap_text(resource_id, columns['Resource ID'])
+                  wrapped_type = wrap_text(resource_type, columns['Resource Type'])
+                  wrapped_details = wrap_text(action_details, columns['Action Details'])
+
+                  # Get maximum number of lines needed for this row
+                  max_lines = max(len(wrapped_id), len(wrapped_type), len(wrapped_details))
+
+                  # Pad wrapped text arrays to match max_lines
+                  wrapped_id.extend([''] * (max_lines - len(wrapped_id)))
+                  wrapped_type.extend([''] * (max_lines - len(wrapped_type)))
+                  wrapped_details.extend([''] * (max_lines - len(wrapped_details)))
+
+                  # Create each line of the row
+                  for i in range(max_lines):
+                      row = '|'
+                      row += f' {wrapped_id[i]:<{columns["Resource ID"]}} |'
+                      row += f' {wrapped_type[i]:<{columns["Resource Type"]}} |'
+                      row += f' {wrapped_details[i]:<{columns["Action Details"]}} |'
+                      rows.append(row)
+
+              # Combine all parts
+              table = '\n'.join([
+                  header,
+                  separator,
+                  '\n'.join(rows)
+              ])
+
+              return table
+
+          def lambda_handler(event, context):
+              print("Starting lambda execution")
+              print(f"Received event: {json.dumps(event)}")
+              
+              table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+              try:
+                # Extract execution ID from the 'name' field
+                execution_id = event['detail']['name']
+                print(f"Extracted execution ID: {execution_id}")
+                
+                # Query DynamoDB for items matching the execution_id
+                response = table.query(
+                    KeyConditionExpression=Key('ExecutionID').eq(execution_id)
+                )
+                
+                # Get items from response
+                items = response.get('Items', [])
+                
+                # Print items for debugging
+                print(f"Number of items found: {len(items)}")
+                print("Items retrieved from DynamoDB:")
+                for item in items:
+                    print(json.dumps(item, indent=2))
+                
+                if items:
+                    # Format items into table
+                    formatted_message = create_table_format(items)
+                    
+                    # Send formatted message to SNS
+                    sns_response = sns.publish(
+                        TopicArn=os.environ['SNS_TOPIC_ARN'],
+                        Subject='AWS Budget Control Actions Report',
+                        Message=formatted_message
+                    )
+                    print(f"Message sent to SNS: {sns_response}")
+                
+                return {
+                    'statusCode': 200,
+                    'body': 'Successfully processed and sent notification'
+                }
+              
+              except KeyError as e:
+                  print(f"Error: Missing key - {str(e)}")
+                  return {
+                      'statusCode': 400,
+                      'body': f'Missing required field in event: {str(e)}'
+                  }
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error processing event: {str(e)}'
+                  }
+
+# Reporting Function - Event Bridge Rule:
+  BudgetsActionReportEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: budgets-control-actions-reporting-SFSuccessfulExecution
+      Description: "Rule to capture successful executions of the Budget Control state machine"
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - Step Functions Execution Status Change
+        detail:
+          status:
+            - SUCCEEDED
+          stateMachineArn:
+            - !Ref StateMachineBudgetControl
+      Targets:
+        - Arn: !GetAtt ActionsTakenReportingFunction.Arn  # Replace with your target resource
+          Id: "ProcessSuccessfulExecution"
+  # Permission for EventBridge to invoke the target
+  TargetPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ActionsTakenReportingFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BudgetsActionReportEventBridgeRule.Arn
+
+  StateMachineBudgetControl:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString: !Sub |
+          {             
+              "Comment": "State machine to trigger the config rule and re-evaluate the resources and take actions",
+              "StartAt": "ConfigRulesEvaluation",
+              "States": {
+                "ConfigRulesEvaluation": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:config:startConfigRulesEvaluation",
+                  "Parameters": {
+                    "ConfigRuleNames": [
+                      "${awscustomlambdaconfigdemorule}"
+                    ]
+                  },
+                  "Next": "WaitForRuleEvaluationtoComplete"
+                },
+                "WaitForRuleEvaluationtoComplete": {
+                  "Type": "Wait",
+                  "Seconds": 60,
+                  "Next": "ConfigRuleEvaluationStatus"
+                },
+                "ConfigRuleEvaluationStatus": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:config:describeConfigRuleEvaluationStatus",
+                  "Parameters": {
+                    "ConfigRuleNames": [
+                      "${awscustomlambdaconfigdemorule}"
+                    ]
+                  },
+                  "Next": "CheckEvaluationTime"
+                },
+                "CheckEvaluationTime": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.ConfigRulesEvaluationStatus[0].LastSuccessfulEvaluationTime",
+                      "StringGreaterThanPath": "$$.Execution.StartTime",
+                      "Next": "Query"
+                    }
+                  ],
+                  "Default": "WaitForRuleEvaluationtoComplete"
+                },
+                "Query": {
+                  "Type": "Task",
+                  "Parameters": {
+                    "TableName": "${AuditResourceInfoDefaultTag }",
+                    "FilterExpression": "TagApplied IN (:tagValue1, :tagValue2, :tagValue3) AND ActionStatus = :actionTakenValue",
+                    "ExpressionAttributeValues": {
+                      ":tagValue1": {
+                        "S": "Stop"
+                      },
+                      ":tagValue2": {
+                        "S": "Inform"
+                      },
+                      ":tagValue3": {
+                        "S": "Terminate"
+                      },
+                      ":actionTakenValue": {
+                        "S": "pending"
+                      }
+                    }
+                  },
+                  "Resource": "arn:aws:states:::aws-sdk:dynamodb:scan",
+                  "ResultSelector": {
+                    "Items.$": "$.Items"
+                  },
+                  "Next": "Map"
+                },
+                "Map": {
+                  "Type": "Map",
+                  "ItemProcessor": {
+                    "ProcessorConfig": {
+                      "Mode": "INLINE"
+                    },
+                    "StartAt": "Extract_InstanceId",
+                    "States": {
+                      "Extract_InstanceId": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "InstanceId.$": "$.ResourceId.S",
+                          "TagApplied.$": "$.TagApplied.S",
+                          "ResourceType.$": "$.ResourceType.S",
+                          "AuditTimestamp.$": "$.AuditTimestamp"
+                        },
+                        "Next": "ResourceType_Choice"
+                      },
+                      "ResourceType_Choice": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.ResourceType",
+                            "StringEquals": "AWS::SageMaker::NotebookInstance",
+                            "Next": "SageMaker_DescribeNotebookInstance"
+                          },
+                          {
+                            "Variable": "$.ResourceType",
+                            "StringEquals": "AWS::EC2::Instance",
+                            "Next": "EC2_Describe_Instance_Status"
+                          },
+                          {
+                            "Variable": "$.ResourceType",
+                            "StringEquals": "AWS::OpenSearchServerless::Collection",
+                            "Next": "CheckCollectionStatus"
+                          },
+                          {
+                            "Variable": "$.ResourceType",
+                            "StringEquals": "AWS::OpenSearch::Domain",
+                            "Next": "CheckOSDomainStatus"
+                          },
+                          {
+                            "Variable": "$.ResourceType",
+                            "StringEquals": "AWS::SageMaker::Domain",
+                            "Next": "SageMakerDomainPass"
+                          },
+                          {
+                            "Variable": "$.ResourceType",
+                            "StringEquals": "AWS::RDS::DBCluster",
+                            "Next": "RDSClusterPass"
+                          }
+                        ],
+                        "Default": "Delete_AuditResourceInfoDefaultTag _From_Default"
+                      },
+                      "CheckCollectionStatus": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:opensearchserverless:batchGetCollection",
+                        "Parameters": {
+                          "Names.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.status",
+                        "Next": "IsCollectionActive"
+                      },
+                      "CheckOSDomainStatus": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:opensearch:describeDomains",
+                        "Parameters": {
+                          "DomainNames.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.status",
+                        "Next": "IsOSDomainCreationInProgress"
+                      },
+                      "IsCollectionActive": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.status.CollectionDetails[0].Status",
+                            "StringEquals": "ACTIVE",
+                            "Next": "Inform or Terminate Collection"
+                          },
+                          {
+                            "Variable": "$.status.CollectionDetails[0].Status",
+                            "StringEquals": "CREATING",
+                            "Next": "WaitForCollectionCreation"
+                          },
+                          {
+                            "Variable": "$.status.CollectionDetails[0].Status",
+                            "StringEquals": "DELETING",
+                            "Next": "WaitForCollectionDeletion"
+                          }
+                        ],
+                        "Default": "CollectionNotFound"
+                      },
+                      "IsOSDomainCreationInProgress": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.status.DomainStatusList[0].Created",
+                            "BooleanEquals": true,
+                            "Next": "Inform or Terminate OS Domain"
+                          },
+                          {
+                            "Variable": "$.status.DomainStatusList[0].Created",
+                            "BooleanEquals": false,
+                            "Next": "WaitForOSDomainCreation"
+                          }
+                        ],
+                        "Default": "OSDomainNotFound"
+                      },
+                      "Inform or Terminate Collection": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Terminate",
+                            "Next": "DeleteCollection"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Inform",
+                            "Next": "Update_Action_Status_Collection_Inform"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_Collection_Unknown_Tag"
+                      },
+                      "Inform or Terminate OS Domain": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Terminate",
+                            "Next": "DeleteOSDomain"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Inform",
+                            "Next": "Update_Action_Status_OSDomain_Inform"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_OSDomain_Unknown_Tag"
+                      },
+                      "Update_Action_Status_OSDomain_Unknown_Tag": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :unknownTag,  AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":unknownTag": {
+                              "S": "Stop - OSDomain cannot be stopped"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_OSDomain"
+                      },
+                      "Update_Action_Status_Collection_Unknown_Tag": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :unknownTag,  AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":unknownTag": {
+                              "S": "Stop - Collection cannot be stopped"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_OSCollection"
+                      },
+                      "CollectionNotFound": {
+                        "Type": "Fail",
+                        "Error": "CollectionNotFound",
+                        "Cause": "The specified OpenSearch Serverless collection was not found or is already deleted."
+                      },
+                      "OSDomainNotFound": {
+                        "Type": "Fail",
+                        "Error": "OSDomainNotFound",
+                        "Cause": "The specified OpenSearch Domain was not found or is already deleted."
+                      },
+                      "DeleteCollection": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:opensearchserverless:deleteCollection",
+                        "Parameters": {
+                          "Id.$": "$.status.CollectionDetails[0].Id"
+                        },
+                        "ResultPath": "$.deleteCollectionResponse",
+                        "Next": "WaitForCollectionDeletion",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "DeleteOSDomain": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:opensearch:deleteDomain",
+                        "Parameters": {
+                          "DomainName.$": "$.status.DomainStatusList[0].DomainName"
+                        },
+                        "ResultPath": "$.deleteOSDomainResponse",
+                        "Next": "WaitForOSDomainDeletion",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "WaitForCollectionDeletion": {
+                        "Type": "Wait",
+                        "Seconds": 70,
+                        "Next": "ConfirmCollectionDeletion"
+                      },
+                      "WaitForOSDomainDeletion": {
+                        "Type": "Wait",
+                        "Seconds": 150,
+                        "Next": "ConfirmOSDomainDeletion"
+                      },
+                      "WaitForCollectionCreation": {
+                        "Type": "Wait",
+                        "Seconds": 70,
+                        "Next": "CheckCollectionStatus"
+                      },
+                      "WaitForOSDomainCreation": {
+                        "Type": "Wait",
+                        "Seconds": 120,
+                        "Next": "CheckOSDomainStatus"
+                      },
+                      "ConfirmCollectionDeletion": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:opensearchserverless:batchGetCollection",
+                        "Parameters": {
+                          "Names.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.collectionDeletionStatus",
+                        "Next": "CheckCollectionLength"
+                      },
+                      "ConfirmOSDomainDeletion": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:opensearch:describeDomains",
+                        "Parameters": {
+                          "DomainNames.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.collectionOSDomainStatus",
+                        "Next": "CheckOSDomainCount"
+                      },
+                      "CheckCollectionLength": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "arrayLength.$": "States.ArrayLength($.collectionDeletionStatus.CollectionDetails)"
+                        },
+                        "ResultPath": "$.collectionCount",
+                        "Next": "IsCollectionDeleted"
+                      },
+                      "CheckOSDomainCount": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "arrayLength.$": "States.ArrayLength($.collectionOSDomainStatus.DomainStatusList)"
+                        },
+                        "ResultPath": "$.osDomainCount",
+                        "Next": "IsOSDomainDeleted"
+                      },
+                      "IsCollectionDeleted": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.collectionCount.arrayLength",
+                            "NumericEquals": 0,
+                            "Next": "Update_Action_Status_OS_Deletecollection"
+                          }
+                        ],
+                        "Default": "WaitForCollectionDeletion"
+                      },
+                      "IsOSDomainDeleted": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.osDomainCount.arrayLength",
+                            "NumericEquals": 0,
+                            "Next": "Update_Action_Status_OS_DeleteDomain"
+                          }
+                        ],
+                        "Default": "WaitForOSDomainDeletion"
+                      },
+                      "Update_Action_Status_OS_DeleteDomain": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Terminated, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Terminated": {
+                              "S": "Terminated the resource"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_OSDomain"
+                      },
+                      "Update_Action_Status_OS_Deletecollection": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Terminated, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Terminated": {
+                              "S": "Terminated the resource"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_OSCollection"
+                      },
+                      "SageMakerDomainPass": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "DomainId.$": "$.InstanceId",
+                          "BudgetControlAction.$": "$.TagApplied",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp"
+                        },
+                        "Next": "SageMakerDomainChoice"
+                      },
+                      "SageMakerDomainChoice": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Or": [
+                              {
+                                "Variable": "$.BudgetControlAction",
+                                "StringEquals": "Stop"
+                              },
+                              {
+                                "Variable": "$.BudgetControlAction",
+                                "StringEquals": "Terminate"
+                              }
+                            ],
+                            "Next": "SageMakerDomainListApps"
+                          },
+                          {
+                            "Variable": "$.BudgetControlAction",
+                            "StringEquals": "Inform",
+                            "Next": "Update_Action_Status_SageMakerDomain_Inform"
+                          }
+                        ],
+                        "Default": "SageMakerDomainUnknown"
+                      },
+                      "SageMakerDomainUnknown": {
+                        "Type": "Fail",
+                        "Error": "unknownTag",
+                        "Cause": "Unknown action type."
+                      },
+                      "SageMakerDomainListApps": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DomainIdEquals.$": "$.DomainId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:listApps",
+                        "ResultPath": "$.AppList",
+                        "Next": "ProcessAppsInSageMakerDomain",
+                        "Comment": "Only list apps in the domain that is being processed."
+                      },
+                      "ProcessAppsInSageMakerDomain": {
+                        "Type": "Map",
+                        "ItemProcessor": {
+                          "ProcessorConfig": {
+                            "Mode": "INLINE"
+                          },
+                          "StartAt": "UserProfileOrSpaceNameSet",
+                          "States": {
+                            "UserProfileOrSpaceNameSet": {
+                              "Type": "Choice",
+                              "Choices": [
+                                {
+                                  "Variable": "$.UserProfileName",
+                                  "IsPresent": true,
+                                  "Next": "IsUserProfileAppAlreadyDeleted"
+                                },
+                                {
+                                  "Variable": "$.SpaceName",
+                                  "IsPresent": true,
+                                  "Next": "IsSpaceNameAppAlreadyDeleted"
+                                }
+                              ],
+                              "Default": "RequiredAppParameterMissing",
+                              "Comment": "App must have UserProfileName OR SpaceName, but can't have both."
+                            },
+                            "IsSpaceNameAppAlreadyDeleted": {
+                              "Type": "Choice",
+                              "Choices": [
+                                {
+                                  "Variable": "$.Status",
+                                  "StringEquals": "Deleted",
+                                  "Next": "UserSpaceAppWasPreviouslyDeleted"
+                                }
+                              ],
+                              "Default": "DeleteAppWithSpaceName"
+                            },
+                            "UserSpaceAppWasPreviouslyDeleted": {
+                              "Type": "Pass",
+                              "End": true
+                            },
+                            "IsUserProfileAppAlreadyDeleted": {
+                              "Type": "Choice",
+                              "Choices": [
+                                {
+                                  "Variable": "$.Status",
+                                  "StringEquals": "Deleted",
+                                  "Next": "UserProfileAppWasPreviouslyDeleted"
+                                }
+                              ],
+                              "Default": "DeleteAppWithUserProfileName"
+                            },
+                            "UserProfileAppWasPreviouslyDeleted": {
+                              "Type": "Pass",
+                              "End": true
+                            },
+                            "RequiredAppParameterMissing": {
+                              "Type": "Fail",
+                              "Error": "ParameterMissing",
+                              "Cause": "A required parameter is missing."
+                            },
+                            "DeleteAppWithUserProfileName": {
+                              "Type": "Task",
+                              "Parameters": {
+                                "AppName.$": "$.AppName",
+                                "AppType.$": "$.AppType",
+                                "DomainId.$": "$.DomainId",
+                                "UserProfileName.$": "$.UserProfileName"
+                              },
+                              "Resource": "arn:aws:states:::aws-sdk:sagemaker:deleteApp",
+                              "Retry": [
+                                {
+                                  "ErrorEquals": [
+                                    "States.TaskFailed"
+                                  ],
+                                  "BackoffRate": 2,
+                                  "MaxAttempts": 3,
+                                  "IntervalSeconds": 30,
+                                  "JitterStrategy": "FULL"
+                                }
+                              ],
+                              "End": true
+                            },
+                            "DeleteAppWithSpaceName": {
+                              "Type": "Task",
+                              "Parameters": {
+                                "AppName.$": "$.AppName",
+                                "AppType.$": "$.AppType",
+                                "DomainId.$": "$.DomainId",
+                                "SpaceName.$": "$.SpaceName"
+                              },
+                              "Resource": "arn:aws:states:::aws-sdk:sagemaker:deleteApp",
+                              "Retry": [
+                                {
+                                  "ErrorEquals": [
+                                    "States.TaskFailed"
+                                  ],
+                                  "BackoffRate": 2,
+                                  "MaxAttempts": 3,
+                                  "IntervalSeconds": 30,
+                                  "JitterStrategy": "FULL"
+                                }
+                              ],
+                              "End": true
+                            }
+                          }
+                        },
+                        "ItemsPath": "$.AppList.Apps",
+                        "ResultPath": "$.AppResults",
+                        "Next": "PrepareToProcessSageMakerDomain"
+                      },
+                      "PrepareToProcessSageMakerDomain": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "DomainId.$": "$.DomainId",
+                          "BudgetControlAction.$": "$.BudgetControlAction",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp"
+                        },
+                        "Next": "DeleteSageMakerDomainChoice"
+                      },
+                      "DeleteSageMakerDomainChoice": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.BudgetControlAction",
+                            "StringEquals": "Terminate",
+                            "Next": "WaitForAppsToStop"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_SageMakerDomain_Stop"
+                      },
+                      "WaitForAppsToStop": {
+                        "Type": "Wait",
+                        "Seconds": 60,
+                        "Next": "ListSpaces"
+                      },
+                      "ListSpaces": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DomainIdEquals.$": "$.DomainId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:listSpaces",
+                        "ResultPath": "$.SpacesList",
+                        "Next": "DeleteSpaces"
+                      },
+                      "DeleteSpaces": {
+                        "Type": "Map",
+                        "ItemProcessor": {
+                          "ProcessorConfig": {
+                            "Mode": "INLINE"
+                          },
+                          "StartAt": "DeleteSpace",
+                          "States": {
+                            "DeleteSpace": {
+                              "Type": "Task",
+                              "Parameters": {
+                                "DomainId.$": "$.DomainId",
+                                "SpaceName.$": "$.SpaceName"
+                              },
+                              "Resource": "arn:aws:states:::aws-sdk:sagemaker:deleteSpace",
+                              "End": true
+                            }
+                          }
+                        },
+                        "ItemsPath": "$.SpacesList.Spaces",
+                        "ResultPath": "$.SpacesResult",
+                        "Next": "PrepareToDeleteUserProfiles",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "PrepareToDeleteUserProfiles": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "DomainId.$": "$.DomainId",
+                          "BudgetControlAction.$": "$.BudgetControlAction",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp"
+                        },
+                        "Next": "WaitForSpacesToClear"
+                      },
+                      "WaitForSpacesToClear": {
+                        "Type": "Wait",
+                        "Seconds": 60,
+                        "Next": "ListUserProfiles"
+                      },
+                      "ListUserProfiles": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DomainIdEquals.$": "$.DomainId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:listUserProfiles",
+                        "ResultPath": "$.UserProfilesList",
+                        "Next": "DeleteUserProfiles"
+                      },
+                      "DeleteUserProfiles": {
+                        "Type": "Map",
+                        "ItemProcessor": {
+                          "ProcessorConfig": {
+                            "Mode": "INLINE"
+                          },
+                          "StartAt": "DeleteUserProfile",
+                          "States": {
+                            "DeleteUserProfile": {
+                              "Type": "Task",
+                              "Parameters": {
+                                "DomainId.$": "$.DomainId",
+                                "UserProfileName.$": "$.UserProfileName"
+                              },
+                              "Resource": "arn:aws:states:::aws-sdk:sagemaker:deleteUserProfile",
+                              "End": true
+                            }
+                          }
+                        },
+                        "ItemsPath": "$.UserProfilesList.UserProfiles",
+                        "ResultPath": "$.UserProfilesResult",
+                        "Next": "PrepareToDeleteSageMakerDomain",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "PrepareToDeleteSageMakerDomain": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "DomainId.$": "$.DomainId",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp",
+                          "BudgetControlAction.$": "$.BudgetControlAction"
+                        },
+                        "Next": "WaitForUserProfilesToClear"
+                      },
+                      "WaitForUserProfilesToClear": {
+                        "Type": "Wait",
+                        "Seconds": 60,
+                        "Next": "DeleteSageMakerDomain"
+                      },
+                      "DeleteSageMakerDomain": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DomainId.$": "$.DomainId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:deleteDomain",
+                        "ResultPath": null,
+                        "Next": "Update_Action_Status_SageMakerDomain_Delete",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "Update_Action_Status_SageMakerDomain_Delete": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Terminated,  AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Terminated": {
+                              "S": "Terminated the SageMaker domain"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.DomainId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.BudgetControlAction"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_SageMakerDomain"
+                      },
+                      "Update_Action_Status_SageMakerDomain_Stop": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Stopped, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Stopped": {
+                              "S": "Stopped the SageMaker domain"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.DomainId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.BudgetControlAction"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_SageMakerDomain"
+                      },
+                      "Update_Action_Status_SageMakerDomain_Inform": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Inform,AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Inform": {
+                              "S": "Inform: no action taken"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.DomainId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.BudgetControlAction"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_SageMakerDomain"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_SageMakerDomain": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.DomainId"
+                            }
+                          }
+                        },
+                        "Next": "Success_SageMakerDomain"
+                      },
+                      "Success_SageMakerDomain": {
+                        "Type": "Succeed"
+                      },
+                      "SageMaker_DescribeNotebookInstance": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeNotebookInstance",
+                        "Parameters": {
+                          "NotebookInstanceName.$": "$.InstanceId"
+                        },
+                        "ResultPath": "$.NotebookInfo",
+                        "Next": "Notebook_Status_Choice"
+                      },
+                      "Notebook_Status_Choice": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Inform",
+                            "Next": "Update_AuditResourceInfoDefaultTag _From_Default"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Stop",
+                            "Next": "Check_SageMaker_Stop_Status"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Terminate",
+                            "Next": "Check_SageMaker_Terminate_Status"
+                          }
+                        ],
+                        "Default": "Delete_AuditResourceInfoDefaultTag _From_Default"
+                      },
+                      "Check_SageMaker_Stop_Status": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.NotebookInfo.NotebookInstanceStatus",
+                            "StringEquals": "InService",
+                            "Next": "StopNotebookInstance"
+                          },
+                          {
+                            "Variable": "$.NotebookInfo.NotebookInstanceStatus",
+                            "StringEquals": "Pending",
+                            "Next": "pending Wait for Notebook Stop"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_SageMaker_Stopped"
+                      },
+                      "StopNotebookInstance": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:stopNotebookInstance",
+                        "Parameters": {
+                          "NotebookInstanceName.$": "$.InstanceId"
+                        },
+                        "ResultPath": null,
+                        "Next": "Wait for Notebook Stop",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "Wait for Notebook Stop": {
+                        "Type": "Wait",
+                        "Seconds": 100,
+                        "Next": "DescribeNotebookInstance after Stop"
+                      },
+                      "DescribeNotebookInstance after Stop": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "NotebookInstanceName.$": "$.InstanceId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeNotebookInstance",
+                        "Next": "Check Notebook Status",
+                        "ResultPath": "$.newState"
+                      },
+                      "Check Notebook Status": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.newState.NotebookInstanceStatus",
+                            "StringEquals": "Stopped",
+                            "Next": "Update_Action_Status_SageMaker_Stopped"
+                          }
+                        ],
+                        "Default": "Wait for Notebook Stop"
+                      },
+                      "Update_Action_Status_Collection_Inform": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Inform,AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Inform": {
+                              "S": "Inform: no action taken"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_OSCollection"
+                      },
+                      "Update_Action_Status_OSDomain_Inform": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Inform, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Inform": {
+                              "S": "Inform: no action taken"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_OSDomain"
+                      },
+                      "Update_AuditResourceInfoDefaultTag _From_Default": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Inform, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Inform": {
+                              "S": "Inform: no action taken"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_Default"
+                      },
+                      "Update_Action_Status_SageMaker_Stopped": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Stopped, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Stopped": {
+                              "S": "Stopped the resource"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_SageMaker"
+                      },
+                      "Check_SageMaker_Terminate_Status": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.NotebookInfo.NotebookInstanceStatus",
+                            "StringEquals": "Stopped",
+                            "Next": "DeleteNotebookInstance"
+                          },
+                          {
+                            "Variable": "$.NotebookInfo.NotebookInstanceStatus",
+                            "StringEquals": "Pending",
+                            "Next": "pending Wait for Notebook Stop"
+                          }
+                        ],
+                        "Default": "StopNotebookInstanceBeforeTerminate"
+                      },
+                      "pending Wait for Notebook Stop": {
+                        "Type": "Wait",
+                        "Seconds": 100,
+                        "Next": "SageMaker_DescribeNotebookInstance"
+                      },
+                      "StopNotebookInstanceBeforeTerminate": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:stopNotebookInstance",
+                        "Parameters": {
+                          "NotebookInstanceName.$": "$.InstanceId"
+                        },
+                        "ResultPath": null,
+                        "Next": "Terminate Wait for Notebook Stop",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "Terminate Wait for Notebook Stop": {
+                        "Type": "Wait",
+                        "Seconds": 100,
+                        "Next": "Terminate DescribeNotebookInstance after Stop"
+                      },
+                      "Terminate DescribeNotebookInstance after Stop": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "NotebookInstanceName.$": "$.InstanceId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeNotebookInstance",
+                        "Next": "Terminate Check Notebook Status",
+                        "ResultPath": "$.newState"
+                      },
+                      "Terminate Check Notebook Status": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.newState.NotebookInstanceStatus",
+                            "StringEquals": "Stopped",
+                            "Next": "DeleteNotebookInstance"
+                          }
+                        ],
+                        "Default": "Terminate Wait for Notebook Stop"
+                      },
+                      "DeleteNotebookInstance": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:deleteNotebookInstance",
+                        "Parameters": {
+                          "NotebookInstanceName.$": "$.InstanceId"
+                        },
+                        "ResultPath": null,
+                        "Next": "Wait for Notebook Delete",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "Wait for Notebook Delete": {
+                        "Type": "Wait",
+                        "Seconds": 100,
+                        "Next": "ListNotebookInstances after Delete"
+                      },
+                      "ListNotebookInstances after Delete": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "NameContains.$": "$.InstanceId"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:sagemaker:listNotebookInstances",
+                        "Next": "Check Notebook Instances Count",
+                        "ResultPath": "$.newState"
+                      },
+                      "Check Notebook Instances Count": {
+                        "Type": "Pass",
+                        "ResultPath": "$.NotebookInstanceCount",
+                        "Parameters": {
+                          "Count.$": "States.ArrayLength($.newState.NotebookInstances)"
+                        },
+                        "Next": "Is Notebook Instance Count Zero"
+                      },
+                      "Is Notebook Instance Count Zero": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.NotebookInstanceCount.Count",
+                            "NumericEquals": 0,
+                            "Next": "Update_Action_Status_SageMaker_Terminated"
+                          }
+                        ],
+                        "Default": "Delete_AuditResourceInfoDefaultTag _From_SageMaker"
+                      },
+                      "Update_Action_Status_SageMaker_Terminated": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Terminated, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Terminated": {
+                              "S": "Terminated the resource"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_SageMaker"
+                      },
+                      "RDSClusterPass": {
+                        "Type": "Pass",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.InstanceId",
+                          "DbClusterResourceId.$": "$.InstanceId",
+                          "BudgetControlAction.$": "$.TagApplied",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp"
+                        },
+                        "Next": "GetStatusOfRDSCluster"
+                      },
+                      "GetStatusOfRDSCluster": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "Filters": [
+                            {
+                              "Name": "db-cluster-resource-id",
+                              "Values.$": "States.Array($.DbClusterResourceId)"
+                            }
+                          ]
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+                        "Next": "AddRDSClusterStatusToState",
+                        "ResultPath": "$.Data"
+                      },
+                      "AddRDSClusterStatusToState": {
+                        "Type": "Pass",
+                        "Next": "RDSClusterBCAction",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.Data.DbClusters.[0].DbClusterIdentifier",
+                          "DbClusterResourceId.$": "$.DbClusterResourceId",
+                          "BudgetControlAction.$": "$.BudgetControlAction",
+                          "Status.$": "$.Data.DbClusters.[0].Status",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp",
+                          "DbClusterMembers.$": "$.Data.DbClusters.[0].DbClusterMembers"
+                        }
+                      },
+                      "RDSClusterBCAction": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.BudgetControlAction",
+                            "StringEquals": "Stop",
+                            "Next": "OkayToStopRDSDBCluster"
+                          },
+                          {
+                            "Variable": "$.BudgetControlAction",
+                            "StringEquals": "Terminate",
+                            "Next": "RDSClusterMustBeAvailable"
+                          },
+                          {
+                            "Variable": "$.BudgetControlAction",
+                            "StringEquals": "Inform",
+                            "Next": "Update_Action_Status_RDS_InformCluster"
+                          }
+                        ],
+                        "Default": "RDSDBClusterUnknownAction"
+                      },
+                      "RDSClusterMustBeAvailable": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.Status",
+                            "StringEquals": "stopped",
+                            "Next": "StartDBCluster"
+                          },
+                          {
+                            "Variable": "$.Status",
+                            "StringEquals": "available",
+                            "Next": "DeleteRDSClusterMembers"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_RDS_DeleteCluster"
+                      },
+                      "StartDBCluster": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:rds:startDBCluster",
+                        "Next": "UpdateRDSClusterStatusAfterStart",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ],
+                        "ResultPath": "$.StartResults"
+                      },
+                      "UpdateRDSClusterStatusAfterStart": {
+                        "Type": "Pass",
+                        "Next": "WaitForRDSClusterStart",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier",
+                          "DbClusterResourceId.$": "$.DbClusterResourceId",
+                          "BudgetControlAction.$": "$.BudgetControlAction",
+                          "Status.$": "$.StartResults.DbCluster.Status",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp",
+                          "DbClusterMembers.$": "$.DbClusterMembers"
+                        }
+                      },
+                      "WaitForRDSClusterStart": {
+                        "Type": "Wait",
+                        "Seconds": 300,
+                        "Next": "DescribeDBClusters"
+                      },
+                      "DescribeDBClusters": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:rds:describeDBClusters",
+                        "Next": "AddNewRDSClusterStatusToState",
+                        "ResultPath": "$.Data"
+                      },
+                      "AddNewRDSClusterStatusToState": {
+                        "Type": "Pass",
+                        "Next": "DoneWaitingForRDSClusterStart",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier",
+                          "DbClusterResourceId.$": "$.DbClusterResourceId",
+                          "BudgetControlAction.$": "$.BudgetControlAction",
+                          "Status.$": "$.Data.DbClusters.[0].Status",
+                          "ResourceType.$": "$.ResourceType",
+                          "AuditTimestamp.$": "$.AuditTimestamp",
+                          "DbClusterMembers.$": "$.Data.DbClusters.[0].DbClusterMembers"
+                        }
+                      },
+                      "DoneWaitingForRDSClusterStart": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.Status",
+                            "StringEquals": "available",
+                            "Next": "DeleteRDSClusterMembers"
+                          },
+                          {
+                            "Variable": "$.Status",
+                            "StringEquals": "starting",
+                            "Next": "WaitForRDSClusterStart"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_RDS_DeleteCluster"
+                      },
+                      "DeleteRDSClusterMembers": {
+                        "Type": "Map",
+                        "ItemProcessor": {
+                          "ProcessorConfig": {
+                            "Mode": "INLINE"
+                          },
+                          "StartAt": "DeleteDBInstance",
+                          "States": {
+                            "DeleteDBInstance": {
+                              "Type": "Task",
+                              "Parameters": {
+                                "DbInstanceIdentifier.$": "$.DbInstanceIdentifier"
+                              },
+                              "Resource": "arn:aws:states:::aws-sdk:rds:deleteDBInstance",
+                              "Retry": [
+                                {
+                                  "ErrorEquals": [
+                                    "States.TaskFailed"
+                                  ],
+                                  "BackoffRate": 2,
+                                  "MaxAttempts": 3,
+                                  "IntervalSeconds": 30,
+                                  "JitterStrategy": "FULL"
+                                }
+                              ],
+                              "End": true
+                            }
+                          }
+                        },
+                        "Next": "ModifyDBCluster",
+                        "ItemsPath": "$.DbClusterMembers",
+                        "ResultPath": "$.InstanceResults"
+                      },
+                      "ModifyDBCluster": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier",
+                          "ApplyImmediately": "TRUE",
+                          "DeletionProtection": "FALSE"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:rds:modifyDBCluster",
+                        "Next": "DeleteDBCluster",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ],
+                        "ResultPath": "$.ModifyResult"
+                      },
+                      "DeleteDBCluster": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier",
+                          "DeleteAutomatedBackups": "FALSE",
+                          "SkipFinalSnapshot": "FALSE",
+                          "FinalDBSnapshotIdentifier.$": "States.Format('{}-bc-final', $.DbClusterIdentifier)"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:rds:deleteDBCluster",
+                        "Next": "Update_Action_Status_RDS_DeleteCluster",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ],
+                        "ResultPath": "$.DeleteResult"
+                      },
+                      "OkayToStopRDSDBCluster": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.Status",
+                            "StringEquals": "available",
+                            "Next": "StopRDSDBCluster"
+                          },
+                          {
+                            "Or": [
+                              {
+                                "Variable": "$.Status",
+                                "StringEquals": "stopped"
+                              },
+                              {
+                                "Variable": "$.Status",
+                                "StringEquals": "stopping"
+                              }
+                            ],
+                            "Next": "Update_Action_Status_RDS_StopCluster"
+                          }
+                        ],
+                        "Default": "CannotStopRDSDBCluster"
+                      },
+                      "StopRDSDBCluster": {
+                        "Type": "Task",
+                        "Parameters": {
+                          "DbClusterIdentifier.$": "$.DbClusterIdentifier"
+                        },
+                        "Resource": "arn:aws:states:::aws-sdk:rds:stopDBCluster",
+                        "Next": "Update_Action_Status_RDS_StopCluster",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ],
+                        "ResultPath": "$.StopResult"
+                      },
+                      "CannotStopRDSDBCluster": {
+                        "Type": "Fail",
+                        "Error": "CannotStop",
+                        "Cause": "Cluster is in a state that cannot be stopped."
+                      },
+                      "RDSDBClusterUnknownAction": {
+                        "Type": "Fail",
+                        "Error": "UnknownAction",
+                        "Cause": "The BudgetControlAction is not Inform, Stop, or Terminate."
+                      },
+                      "Update_Action_Status_RDS_DeleteCluster": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Terminated,AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Terminated": {
+                              "S": "Terminated the cluster"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.DbClusterResourceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.BudgetControlAction"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_RDS"
+                      },
+                      "Update_Action_Status_RDS_StopCluster": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Stopped, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Stopped": {
+                              "S": "Stopped the cluster"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.DbClusterResourceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.BudgetControlAction"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_RDS"
+                      },
+                      "Update_Action_Status_RDS_InformCluster": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Inform,AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Inform": {
+                              "S": "Inform: no action taken"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.DbClusterResourceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.BudgetControlAction"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_RDS"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_RDS": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.DbClusterResourceId"
+                            }
+                          }
+                        },
+                        "Next": "Success_RDS"
+                      },
+                      "Success_RDS": {
+                        "Type": "Succeed"
+                      },
+                      "EC2_Describe_Instance_Status": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+                        "Parameters": {
+                          "InstanceIds.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.InstanceStatus",
+                        "Next": "Check_EC2_Instance_Status"
+                      },
+                      "Check_EC2_Instance_Status": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.InstanceStatus.Reservations[0].Instances[0].State.Name",
+                            "StringEquals": "stopped",
+                            "Next": "Handle Stopped State"
+                          },
+                          {
+                            "Variable": "$.InstanceStatus.Reservations[0].Instances[0].State.Name",
+                            "StringEquals": "pending",
+                            "Next": "Handle Pending State"
+                          },
+                          {
+                            "Variable": "$.InstanceStatus.Reservations[0].Instances[0].State.Name",
+                            "StringEquals": "running",
+                            "Next": "Stop or Terminate Instance"
+                          },
+                          {
+                            "Variable": "$.InstanceStatus.Reservations[0].Instances[0].State.Name",
+                            "StringEquals": "terminated",
+                            "Next": "Update_Action_Status_EC2_Already_Terminated"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_EC2_Unknown_State"
+                      },
+                      "Handle Pending State": {
+                        "Type": "Wait",
+                        "Seconds": 60,
+                        "Next": "EC2_Describe_Instance_Status"
+                      },
+                      "Stop or Terminate Instance": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Stop",
+                            "Next": "Stop Instance"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Terminate",
+                            "Next": "Terminate Instance"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Inform",
+                            "Next": "Update_Action_Status_EC2_Inform"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_EC2_Unknown_Tag"
+                      },
+                      "Handle Stopped State": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Stop",
+                            "Next": "Update_Action_Status_EC2_Already_Stopped"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Terminate",
+                            "Next": "Terminate Instance"
+                          },
+                          {
+                            "Variable": "$.TagApplied",
+                            "StringEquals": "Inform",
+                            "Next": "Update_Action_Status_EC2_Inform"
+                          }
+                        ],
+                        "Default": "Update_Action_Status_EC2_Unknown_Tag"
+                      },
+                      "Stop Instance": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+                        "Parameters": {
+                          "InstanceIds.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.StoppingInstances",
+                        "Next": "Update_Action_Status_EC2_Stopped",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "Terminate Instance": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:ec2:terminateInstances",
+                        "Parameters": {
+                          "InstanceIds.$": "States.Array($.InstanceId)"
+                        },
+                        "ResultPath": "$.TerminatingInstances",
+                        "Next": "Update_Action_Status_EC2_Terminated",
+                        "Retry": [
+                          {
+                            "ErrorEquals": [
+                              "States.TaskFailed"
+                            ],
+                            "BackoffRate": 2,
+                            "MaxAttempts": 3,
+                            "IntervalSeconds": 30,
+                            "JitterStrategy": "FULL"
+                          }
+                        ]
+                      },
+                      "Update_Action_Status_EC2_Already_Stopped": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :alreadyStopped,  AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":alreadyStopped": {
+                              "S": "resource already Stopped"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Update_Action_Status_EC2_Stopped": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Stopped, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Stopped": {
+                              "S": "resource Stopped"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.StoppingInstances.StoppingInstances[0].InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Update_Action_Status_EC2_Terminated": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Terminated, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Terminated": {
+                              "S": "resource Terminated"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.TerminatingInstances.TerminatingInstances[0].InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Update_Action_Status_EC2_Inform": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :Inform, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":Inform": {
+                              "S": "Inform: no action taken"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Update_Action_Status_EC2_Already_Terminated": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :alreadyTerminated, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":alreadyTerminated": {
+                              "S": "resource already Terminated"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Update_Action_Status_EC2_Unknown_State": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :unknown, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":unknown": {
+                              "S": "unknown state"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Update_Action_Status_EC2_Unknown_Tag": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+                        "Parameters": {
+                          "TableName": "${AuditResouceInfoActionStatus}",
+                          "Key": {
+                            "ExecutionID": {
+                              "S.$": "$$.Execution.Name"
+                            },
+                            "ActionTimestamp": {
+                              "S.$": "States.Format('{}-{}', $$.State.EnteredTime, States.UUID())"
+                            }                            
+                          },
+                          "UpdateExpression": "SET ResourceId = :ResourceId, ActionStatus = :completed, ActionDetails = :unknownTag, AuditTimestamp = :auditTimestamp, ResourceType = :resourceType, TagApplied = :tag",
+                          "ExpressionAttributeValues": {
+                            ":completed": {
+                              "S": "completed"
+                            },
+                            ":unknownTag": {
+                              "S": "unknown tag"
+                            },
+                            ":ResourceId": {
+                              "S.$": "$.InstanceId"
+                            },
+                            ":auditTimestamp": {
+                              "S.$": "$.AuditTimestamp"
+                            },
+                            ":resourceType": {
+                              "S.$": "$.ResourceType"
+                            },
+                            ":tag": {
+                              "S.$": "$.TagApplied"
+                            }
+                          }
+                        },
+                        "ResultPath": null,
+                        "Next": "Delete_AuditResourceInfoDefaultTag _From_EC2"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_EC2": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.InstanceId"
+                            }
+                          }
+                        },
+                        "Next": "Success_EC2"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_SageMaker": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.InstanceId"
+                            }
+                          }
+                        },
+                        "Next": "Success_SageMaker"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_OSCollection": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.InstanceId"
+                            }
+                          }
+                        },
+                        "Next": "Success_OSCollection"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_OSDomain": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.InstanceId"
+                            }
+                          }
+                        },
+                        "Next": "Success_OSDomain"
+                      },
+                      "Delete_AuditResourceInfoDefaultTag _From_Default": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+                        "Parameters": {
+                          "TableName": "${AuditResourceInfoDefaultTag }",
+                          "Key": {
+                            "ResourceId": {
+                              "S.$": "$.InstanceId"
+                            }
+                          }
+                        },
+                        "Next": "Success_Default"
+                      },
+                      "Success_EC2": {
+                        "Type": "Succeed"
+                      },
+                      "Success_SageMaker": {
+                        "Type": "Succeed"
+                      },
+                      "Success_Default": {
+                        "Type": "Succeed"
+                      },
+                      "Success_OSCollection": {
+                        "Type": "Succeed"
+                      },
+                      "Success_OSDomain": {
+                        "Type": "Succeed"
+                      }
+                    }
+                  },
+                  "InputPath": "$.Items",
+                  "End": true
+                }
+              }
+            }  
+      RoleArn: !GetAtt 'SFBudgetControlRole.Arn'
+      LoggingConfiguration:
+        Level: "ALL"
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn      
+
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/${AWS::StackName}-StateMachineBudgetControl"
+      RetentionInDays: 14
+      
+  SFBudgetControlRole:
+      Type: 'AWS::IAM::Role'
+      Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W11
+              reason: "This solution is to demonstrate how customers can control the costs based on the resource tags, we cannot limit the policy to a resource as the solution will take actions on resources based on tags"     
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'              
+            Action: 'sts:AssumeRole'
+        ManagedPolicyArns:
+          - "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"            
+        Policies:
+        # Policy 1: Read-only access policies
+        - PolicyName: ReadOnlyAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Action: 
+                - sagemaker:ListNotebookInstances
+                - sagemaker:ListApps
+                - sagemaker:ListTags
+                - sagemaker:ListSpaces
+                - sagemaker:ListUserProfiles
+                - sagemaker:DescribeDomain
+                - sagemaker:DescribeNotebookInstance
+                - ec2:describeInstances
+                - aoss:ListCollections
+                - aoss:BatchGetCollection             
+                - es:DescribeDomains
+                - rds:AddTagsToResource
+              Effect: Allow
+              Resource: "*"
+    
+        # Policy 2: SageMaker management actions
+        - PolicyName: SageMakerManagementPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - sagemaker:StopNotebookInstance
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:notebook-instance/*
+              Condition:
+                StringEquals:
+                  sagemaker:ResourceTag/BudgetControlAction: ['Terminate','Stop']
+            - Effect: Allow
+              Action:
+                - sagemaker:DeleteNotebookInstance
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:notebook-instance/*
+              Condition:
+                StringEquals:
+                  sagemaker:ResourceTag/BudgetControlAction: 'Terminate'
+    
+        # Policy 3: SageMaker Domain management
+        - PolicyName: SageMakerDomainPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - sagemaker:DeleteDomain
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:domain/*
+              Condition:
+                StringEquals:
+                  sagemaker:ResourceTag/BudgetControlAction: 'Terminate'
+            - Effect: Allow
+              Action:
+                - sagemaker:DeleteSpace
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:space/*
+            - Effect: Allow
+              Action:
+                - sagemaker:DeleteApp
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:app/*
+            - Effect: Allow
+              Action:
+                - sagemaker:DeleteUserProfile
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:user-profile/*
+    
+        # Policy 4: OpenSearch management
+        - PolicyName: OpenSearchManagementPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - aoss:DeleteCollection
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/BudgetControlAction: 'Terminate'
+            - Effect: Allow
+              Action:
+                - es:DeleteDomain
+                - es:DeleteElasticsearchDomain
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:es:${AWS::Region}:${AWS::AccountId}:domain/*
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/BudgetControlAction: 'Terminate'
+    
+        # Policy 5: KMS and Config permissions
+        - PolicyName: KMSAndConfigPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - kms:CreateGrant
+                - kms:Decrypt
+                - kms:DescribeKey
+                - kms:GenerateDataKey
+              Resource: 
+                - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                - !GetAtt SNSEncryptionKey.Arn
+            - Effect: Allow
+              Action:
+                - config:StartConfigRulesEvaluation
+                - config:DescribeConfigRuleEvaluationStatus
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:config:${AWS::Region}:${AWS::AccountId}:config-rule/*              
+    
+        # Policy 6: RDS Cluster management - part 1
+        - PolicyName: RDSClusterManagementPolicy1
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - rds:CreateDBClusterSnapshot
+                - rds:DeleteDBCluster
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster-snapshot:*
+            - Effect: Allow
+              Action:
+                - rds:DeleteDBCluster
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:*
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/BudgetControlAction: 'Terminate'
+    
+        # Policy 7: RDS Cluster management - part 2
+        - PolicyName: RDSClusterManagementPolicy2
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - rds:StopDBCluster
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:*
+              Condition:
+                StringEquals:
+                  aws:ResourceTag/BudgetControlAction: 'Stop'
+            - Effect: Allow
+              Action:
+                - rds:CreateDBClusterSnapshot
+                - rds:DescribeDBClusters
+                - rds:ModifyDBCluster
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:*
+    
+        # Policy 8: RDS Instance and Snapshot management
+        - PolicyName: RDSInstanceSnapshotPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - rds:CreateDBSnapshot
+                - rds:DeleteDBInstance
+                - rds:ModifyDBInstance
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:*
+            - Effect: Allow
+              Action:
+                - rds:CreateDBSnapshot
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:snapshot:*
+    
+        # Policy 9: EC2 instance management
+        - PolicyName: EC2ManagementPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Effect: Allow
+              Action:
+                - ec2:StopInstances
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/BudgetControlAction: 'Stop'
+            - Effect: Allow
+              Action:
+                - ec2:TerminateInstances
+              Resource: 
+                Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              Condition:
+                StringEquals:
+                  ec2:ResourceTag/BudgetControlAction: 'Terminate'
+    
+        # Policy 10: SSM and DynamoDB access
+        - PolicyName: SSMAndDynamoDBPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Action: ssm:GetParameter
+              Effect: Allow
+              Resource:
+                 - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ServiceActionMappingParameter}'
+            - Action: 
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+              Effect: Allow
+              Resource:
+                  Fn::GetAtt:
+                    - AuditResouceInfoActionStatus
+                    - Arn
+            - Action: 
+                  - "dynamodb:scan"
+                  - "dynamodb:DeleteItem"
+              Effect: Allow
+              Resource:
+                  Fn::GetAtt:
+                    - AuditResourceInfoDefaultTag 
+                    - Arn
